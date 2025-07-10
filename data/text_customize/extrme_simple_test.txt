@@ -1,0 +1,15 @@
+extrme_simple_test
+
+VEHICLE
+NUMBER     CAPACITY
+  1         2
+
+CUSTOMER
+CUST NO.  XCOORD.   YCOORD.    DEMAND   READY TIME  DUE DATE   SERVICE   TIME
+
+    0      0          0          0          0       1200          0
+    1      2         0         10        900        970         90
+    2      2         1        10        900        970         90
+station  1  4   4
+station  2  1   0
+station  3  1   0.5

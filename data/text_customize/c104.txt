@@ -1,0 +1,23 @@
+C104
+
+VEHICLE
+NUMBER     CAPACITY
+  4         1000
+
+CUSTOMER
+CUST NO.   XCOORD.  YCOORD.    DEMAND    READY TIME  DUE DATE  SERVICE   TIME
+
+    0      40         50          0          0       1236          0
+   1      35         69         10        448        505         90
+   2      25         85         20          0       1107         90
+   3      22         75         30         30         92         90
+   4      22         85         10          0       1106         90
+   5      20         80         40        384        429         90
+   6      20         85         40          0       1105         90
+   7      18         75         20          0       1112         90
+   8      15         75         20          0       1110         90
+   9      15         80         10          0       1106         90
+
+
+
+  station 3  19.6250   80.0000
