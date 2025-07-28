@@ -452,7 +452,7 @@ from .utils import load_instance, make_dirs_for_file, calculate_distance
 from .core import print_route, plot_vrptw_routes
 
 # 1) 带充电站的解码逻辑
-def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0):
+def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
     """
     把一个访问顺序解码成多条子航线，允许途中去充电站充电。
     子航线里如果访问了 station，会在列表中插入 'station_<idx>' 字符串。
@@ -465,8 +465,11 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0):
     nodes = ['depart'] + cust_keys + stat_keys
     key2idx = {k:i for i,k in enumerate(nodes)}
     D = instance['distance_matrix']
-
+    speed = instance['vehicle_speed']  # 直接读 JSON 里定义的 speed
     max_e = instance['vehicle_capacity']
+    charge_rt = instance['vehicle_charge_rate']
+    degr_rt = instance['vehicle_degradation_rate']
+
     e_left = max_e
     t_elapsed = 0.0
     last_idx = 0   # depot == index 0
@@ -490,8 +493,9 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0):
         d2 = D[cidx][0]
         d2_station = nearest_station_dist[cidx]
         need_dir = (d1 + d2_station) * energy_per_km
-        arr_t = t_elapsed + d1
-        ret_t = arr_t + instance[ckey]['service_time'] + d2
+        arr_t = t_elapsed + d1/speed
+        ret_t = arr_t + instance[ckey]['service_time'] + d2/speed
+
         if e_left >= need_dir :
             sub.append(cid)
             e_left -= need_dir
@@ -512,20 +516,31 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0):
             d_ls = D[last_idx][sidx]
             d_sc = D[sidx][cidx]
             need_via = (d_ls ) * energy_per_km
-            arr_v = t_elapsed + d_ls + d_sc
-            ret_v = arr_v + instance[ckey]['service_time'] + d2
-            if e_left >= need_via :
-                # 插入充电站
-                sub.append(skey)
-                # 充电后从 station→cust→depot
-                e_left = max_e - d_sc *energy_per_km
-                t_elapsed += d_ls
+            arr_v = t_elapsed + d_ls/speed + d_sc/speed
+            ret_v = arr_v + instance[ckey]['service_time'] + d2/speed
+
+            if e_left >= need_via:
+                # 1) 飞到充电站
+                e_left -= need_via
+                t_elapsed += d_ls / speed
                 last_idx = sidx
 
-                # 然后再访问客户 cid
+                # 2) 动态充电：把电充满
+                need_charge = max_e - e_left
+                t_charge = need_charge / charge_rt
+                t_elapsed += t_charge
+                e_left = max_e
+
+                # 3) 插入站点标记
+                sub.append(skey)
+
+                # 4) 飞到客户并服务
+                e_left -= d_sc * energy_per_km
+                t_elapsed += d_sc / speed
+                t_elapsed += instance[ckey]['service_time']
                 sub.append(cid)
-                t_elapsed += d_sc + instance[ckey]['service_time']
                 last_idx = cidx
+
                 charged = True
                 break
 
@@ -538,7 +553,7 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0):
         sub = [cid]
         d0c = D[0][cidx]
         e_left = max_e - d0c*energy_per_km
-        t_elapsed = d0c + instance[ckey]['service_time']
+        t_elapsed = d0c/speed + instance[ckey]['service_time']
         last_idx = cidx
 
     if sub:
@@ -550,6 +565,7 @@ def eval_vrptw_with_stations(individual, instance,
                              unit_cost=1.0, init_cost=0.0,
                              wait_cost=0.0, delay_cost=0.0,
                              energy_per_km=1.0):
+    speed = instance.get('vehicle_speed', 1.0)
     # 1) 先重建 key->idx 的映射
     cust_keys = sorted([k for k in instance if k.startswith('customer_')],
                        key=lambda x: int(x.split('_')[1]))
@@ -578,7 +594,9 @@ def eval_vrptw_with_stations(individual, instance,
             # 3) 用 idx 去 distance_matrix 里取距离
             d = instance['distance_matrix'][last_idx][idx]
             dist += d
-            arr = elapsed + d
+            t_fly = d / speed
+            arr = elapsed + t_fly
+
 
             # 4) 只有 customer 节点才有时间窗惩罚/服务时间
             if not isinstance(node, str):
@@ -599,6 +617,115 @@ def eval_vrptw_with_stations(individual, instance,
         total += init_cost + unit_cost * dist + time_pen
 
     return (1.0 / total, )
+
+
+
+
+def eval_vrptw_with_stations_chargingtime (individual, instance,
+                             unit_cost=1.0, init_cost=0.0,
+                             wait_cost=0.0, delay_cost=0.0,
+                             energy_per_km=1.0):
+    """
+    对带充电站路径进行成本评估。
+    与 eval_vrptw 不同之处在于：
+      - 路径中已包含充电站节点（由 ind2route_with_stations 插入）
+      - 飞行段时间 = distance / vehicle_speed
+      - 充电站节点需计算充电时间并累加到 elapsed
+      - 仅对客户节点计算软时间窗惩罚
+      - 最终成本 = init_cost * (#子航线) + unit_cost * 总距离 + time_penalty
+    返回： (fitness,) ，fitness = 1/total_cost
+    """
+
+    # 1. 全局参数读取
+    speed     = instance['vehicle_speed']               # 车辆飞行速度
+    bat_cap   = instance['vehicle_capacity']         # 电池满电量
+    charge_rt = instance['vehicle_charge_rate']      # 充电速率（电量单位/时间单位）
+
+    # 2. 构建节点到距离矩阵索引的映射
+    cust_keys = sorted([k for k in instance if k.startswith('customer_')],
+                       key=lambda x: int(x.split('_')[1]))
+    stat_keys = sorted([k for k in instance if k.startswith('station_')],
+                       key=lambda x: int(x.split('_')[1]))
+    nodes     = ['depart'] + cust_keys + stat_keys
+    key2idx   = {k: i for i, k in enumerate(nodes)}
+    D         = instance['distance_matrix']
+
+    # 3. 解码：获得含充电站的子航线列表
+    routes = ind2route_with_stations(individual, instance, energy_per_km)
+
+    total_cost = 0.0
+
+    # 4. 遍历每条子航线进行成本计算
+    for sub in routes:
+        dist      = 0.0     # 累计飞行距离成本部分
+        time_pen  = 0.0     # 累计客户时间窗惩罚
+        elapsed   = 0.0     # 子航线内部的时序进度
+        remaining = bat_cap # 当前剩余电量
+        last_idx  = key2idx['depart']
+
+
+        for node in sub:
+            # —— 飞行段 —— #
+            # 找到下一个节点在矩阵中的索引
+            if isinstance(node, str):
+                # node 本身就是 'station_X'
+                idx = key2idx[node]
+            else:
+                # node 是客户编号的整数，要拼出 'customer_<node>'
+                idx = key2idx[f'customer_{node}']
+            # 读取两点距离
+            d   = D[last_idx][idx]
+            dist += d
+            # 耗电 = 距离 * 单位耗电率
+            remaining -= d * energy_per_km
+            # 飞行时间 = 距离 / 速度
+            t_fly   = d / speed
+            arrival = elapsed + t_fly
+
+            if isinstance(node, str):
+                # —— 充电站节点 —— #
+                # 1) （可选）时间窗惩罚
+                ready = instance[node].get('ready_time', 0.0)
+                due   = instance[node].get('due_time', float('inf'))
+                time_pen += wait_cost * max(ready - arrival, 0) \
+                          + delay_cost * max(arrival - due, 0)
+
+                # 2) 动态充电：补满电所需时间
+                need_charge = bat_cap - remaining
+                t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
+
+                # 累加充电时间
+                elapsed   = arrival + t_charge
+                # 电量回满
+                remaining = bat_cap
+
+            else:
+                # —— 客户节点 —— #
+                # 1) 时间窗软惩罚
+                key = f'customer_{node}'
+                ready = instance[key]['ready_time']
+                due   = instance[key]['due_time']
+                time_pen += wait_cost * max(ready - arrival, 0) \
+                          + delay_cost * max(arrival - due, 0)
+
+                # 2) 服务时间累加
+                service = instance[key]['service_time']
+                elapsed = arrival + service
+
+            # 更新当前位置
+            last_idx = idx
+
+        # —— 回仓段 —— #
+        # 回到仓库的距离成本
+        dist += D[last_idx][ key2idx['depart'] ]
+        # 子航线总成本 = init_cost + unit_cost*dist + time_pen
+        total_cost += init_cost + unit_cost * dist + time_pen
+
+    # 防除零
+    if total_cost <= 0:
+        return (float('inf'),)
+    # 适应度 = 1 / 总成本
+    return (1.0 / total_cost,)
 
 
 # 3) GA 主流程改造
@@ -624,7 +751,7 @@ def run_gavrptw_with_stations(instance_name,
     tb.register('ind', tools.initIterate, creator.Individual, tb.idx)
     tb.register('pop', tools.initRepeat, list, tb.ind)
 
-    tb.register('evaluate', eval_vrptw_with_stations,
+    tb.register('evaluate', eval_vrptw_with_stations_chargingtime,
                 instance=instance,
                 unit_cost=unit_cost,
                 init_cost=init_cost,
@@ -672,6 +799,7 @@ def run_gavrptw_with_stations(instance_name,
     print(f"适应度: {best.fitness.values[0]}")
     best_routes = ind2route_with_stations(best, instance, energy_per_km)
     print_route(best_routes)
+    print_route_with_times_chargingtime(best_routes, instance,energy_per_km)
     plot_vrptw_routes_with_stations(instance_name, best_routes, customize=customize_data,save_image=True)
 
 
@@ -771,3 +899,121 @@ def plot_vrptw_routes_with_stations(instance_name,
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         print(f"✅ 路径图已保存到：{filepath}")
     plt.close()
+
+
+
+def print_route_with_times(route, instance):
+    """
+    打印每条子航线，并显示到达每个客户/站点时刻，
+    并且正确区分客户编号和站点编号在 distance_matrix 中的行列位置。
+    同时将距离除以 instance['vehicle_speed'] 得到的时间用来计算 arrival。
+    """
+    D = instance['distance_matrix']
+    speed = instance.get('vehicle_speed', 1.0)  # 默认 1
+
+    # 1) 构建节点顺序：0（仓库） + 所有客户升序 + 所有站点升序
+    cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
+    station_ids = sorted(int(k.split('_')[1]) for k in instance if k.startswith('station_'))
+    node2idx = {0: 0}
+    # 客户从 1 开始
+    for i, cid in enumerate(cust_ids, start=1):
+        node2idx[cid] = i
+    # 站点接着客户编号后面
+    for j, sid in enumerate(station_ids, start=1 + len(cust_ids)):
+        node2idx[f'station_{sid}'] = j
+
+    for vid, sub in enumerate(route, start=1):
+        print(f"Vehicle {vid}:")
+        elapsed   = 0.0
+        last_idx  = node2idx[0]  # depot 的矩阵索引
+        print(f"  Depart depot at t=0.00")
+        for node in sub:
+            idx      = node2idx[node]
+            distance = D[last_idx][idx]
+            t_travel = distance / speed      # ← 用速度换算时间
+            arrival  = elapsed + t_travel
+
+            if isinstance(node, int):
+                # 客户节点
+                print(f"    -> Customer {node} at t={arrival:.2f}")
+                service = instance[f'customer_{node}']['service_time']
+                elapsed = arrival + service
+            else:
+                # 站点节点 'station_X'
+                sid = node.split('_', 1)[1]
+                print(f"    -> Station {sid} at t={arrival:.2f}")
+                # 如果站点存在固定充电时间，则加上：
+                # charge = instance[f'station_{sid}'].get('charge_time', 0.0)
+                # elapsed = arrival + charge
+                elapsed = arrival
+
+            last_idx = idx
+
+        # 回到 depot
+        back_dist = D[last_idx][ node2idx[0] ]
+        t_back    = back_dist / speed        # ← 同样要除以速度
+        print(f"    -> Return depot at t={elapsed + t_back:.2f}\n")
+
+
+def print_route_with_times_chargingtime (route, instance,energy_per_km):
+    """
+    打印每条子航线，并显示到达每个客户/站点时刻，
+    正确区分客户编号和站点编号，并动态加上充电时间。
+    """
+    D          = instance['distance_matrix']
+    speed      = instance['vehicle_speed']
+    bat_cap    = instance['vehicle_capacity']
+    charge_rt  = instance['vehicle_charge_rate']
+    energy_km = energy_per_km
+
+    # 构建矩阵索引映射：0=depot, 1..=customers, then stations
+    cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
+    station_ids = sorted(int(k.split('_')[1]) for k in instance if k.startswith('station_'))
+    node2idx    = {0: 0}
+    for i, cid in enumerate(cust_ids, start=1):
+        node2idx[cid] = i
+    for j, sid in enumerate(station_ids, start=1 + len(cust_ids)):
+        node2idx[f'station_{sid}'] = j
+
+    for vid, sub in enumerate(route, start=1):
+        print(f"Vehicle {vid}:")
+        elapsed   = 0.0
+        remaining = bat_cap
+        last_idx  = node2idx[0]  # depot index
+        print(f"  Depart depot at t=0.00")
+
+        for node in sub:
+            idx      = node2idx[node]
+            # 1) 飞行到下一个节点
+            dist     = D[last_idx][idx]
+            t_fly    = dist / speed
+            arrival  = elapsed + t_fly
+            remaining -= dist * energy_km
+
+            if isinstance(node, int):
+                # 客户节点：打印到达时间 + 服务
+                print(f"    -> Customer {node} at t={arrival:.2f}")
+                service = instance[f'customer_{node}']['service_time']
+                elapsed = arrival + service
+            else:
+                # 充电站节点：打印到达时间
+                sid = node.split('_', 1)[1]
+                print(f"    -> Station {sid} at t={arrival:.2f}", end='')
+
+                # 2) 动态计算充电时间
+                need_charge = bat_cap - remaining
+                t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
+
+
+                # 打印充电时长
+                print(f", charging for {t_charge:.2f}")
+                # 累加充电时间并恢复电量
+                elapsed   = arrival + t_charge
+                remaining = bat_cap
+
+            last_idx = idx
+
+        # 返回 depot
+        back_dist = D[last_idx][ node2idx[0] ]
+        t_back    = back_dist / speed
+        print(f"    -> Return depot at t={elapsed + t_back:.2f}\n")

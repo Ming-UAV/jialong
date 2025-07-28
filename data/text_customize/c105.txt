@@ -2,13 +2,13 @@ C105
 
 VEHICLE
 NUMBER     CAPACITY
-  25         60
+  25         60     1.0
 
 CUSTOMER
 CUST NO.   XCOORD.   YCOORD.   DEMAND    READY TIME   DUE DATE   SERVICE TIME
 
     0      40         50          0          0       1236          0
-   1      35         69         10        420        533         90
+   1      35         69         10        20        533         90
    2      25         85         20        617        756         90
    3      22         75         30         30        155         90
    4      22         85         10        541        646         90

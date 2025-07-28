@@ -245,12 +245,10 @@
         ]
     ],
     "instance_name": "C104",
-    "max_vehicle_number": 4,
     "station_3": {
         "coordinates": {
             "x": 19.625,
             "y": 80.0
         }
-    },
-    "vehicle_capacity": 1000.0
+    }
 }

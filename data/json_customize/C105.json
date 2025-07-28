@@ -6,7 +6,7 @@
         },
         "demand": 10.0,
         "due_time": 533.0,
-        "ready_time": 420.0,
+        "ready_time": 20.0,
         "service_time": 90.0
     },
     "customer_10": {
@@ -675,7 +675,6 @@
         ]
     ],
     "instance_name": "C105",
-    "max_vehicle_number": 25,
     "station_3": {
         "coordinates": {
             "x": 19.625,
@@ -687,6 +686,5 @@
             "x": 5.3333,
             "y": 40.5556
         }
-    },
-    "vehicle_capacity": 60.0
+    }
 }

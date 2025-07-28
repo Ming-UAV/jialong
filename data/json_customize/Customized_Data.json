@@ -12247,7 +12247,6 @@
         ]
     ],
     "instance_name": "Customized_Data",
-    "max_vehicle_number": 3,
     "station_1": {
         "coordinates": {
             "x": 2.0,
@@ -12271,6 +12270,5 @@
             "x": 50.0,
             "y": 50.0
         }
-    },
-    "vehicle_capacity": 300.0
+    }
 }

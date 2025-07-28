@@ -11414,7 +11414,5 @@
             0.0
         ]
     ],
-    "instance_name": "RC204",
-    "max_vehicle_number": 25,
-    "vehicle_capacity": 1000.0
+    "instance_name": "RC204"
 }

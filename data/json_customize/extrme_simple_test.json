@@ -80,7 +80,6 @@
         ]
     ],
     "instance_name": "extrme_simple_test",
-    "max_vehicle_number": 1,
     "station_1": {
         "coordinates": {
             "x": 4.0,
@@ -98,6 +97,5 @@
             "x": 1.0,
             "y": 0.5
         }
-    },
-    "vehicle_capacity": 2.0
+    }
 }
