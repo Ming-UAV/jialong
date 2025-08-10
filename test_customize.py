@@ -8,7 +8,7 @@ def test_run_gavrptw_executes():
     测试 run_gavrptw 是否可以成功运行并不抛出异常
     """
     random.seed(64)
-    instance_name = 'c105'
+    instance_name = 'fly_grassland'
 
     run_gavrptw_with_stations(
         instance_name=instance_name,
@@ -16,7 +16,7 @@ def test_run_gavrptw_executes():
         init_cost=100.0,
         wait_cost=0,
         delay_cost=0,
-        ind_size=18,
+        ind_size=20,
         pop_size=1000,
         cx_pb=0.85,
         mut_pb=0.02,

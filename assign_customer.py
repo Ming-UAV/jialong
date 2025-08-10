@@ -1,7 +1,7 @@
 from algorithm.greedy_cover import cluster_customers, assign_customers_to_centers, greedy_select_stations,find_uncovered_customers
 # 先聚类
 clusters, centers = cluster_customers(
-    instance_name="c105",
+    instance_name="fly_grassland_100",
     n_clusters=range(2,15),
     auto_k= True,
     customize_data=True,
@@ -11,9 +11,9 @@ clusters, centers = cluster_customers(
 
 # 再根据半径 radius生成覆盖映射
 cover_map = assign_customers_to_centers(
-    instance_name="c105",
+    instance_name="fly_grassland_100",
     centers=centers,
-    radius=30,#station的覆盖半径，根据电池电量改
+    radius=56.1,#station的覆盖半径，根据电池电量改
     customize_data=True
 )
 

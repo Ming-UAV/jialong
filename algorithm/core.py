@@ -955,16 +955,17 @@ def print_route_with_times(route, instance):
         print(f"    -> Return depot at t={elapsed + t_back:.2f}\n")
 
 
-def print_route_with_times_chargingtime (route, instance,energy_per_km):
+def print_route_with_times_chargingtime(route, instance, energy_per_km):
     """
     打印每条子航线，并显示到达每个客户/站点时刻，
     正确区分客户编号和站点编号，并动态加上充电时间。
+    并输出总的充电次数和每台无人机的平均充电次数。
     """
     D          = instance['distance_matrix']
     speed      = instance['vehicle_speed']
     bat_cap    = instance['vehicle_capacity']
     charge_rt  = instance['vehicle_charge_rate']
-    energy_km = energy_per_km
+    energy_km  = energy_per_km
 
     # 构建矩阵索引映射：0=depot, 1..=customers, then stations
     cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
@@ -975,45 +976,62 @@ def print_route_with_times_chargingtime (route, instance,energy_per_km):
     for j, sid in enumerate(station_ids, start=1 + len(cust_ids)):
         node2idx[f'station_{sid}'] = j
 
+    total_charge_count = 0
+    per_vehicle_counts = []
+
     for vid, sub in enumerate(route, start=1):
         print(f"Vehicle {vid}:")
         elapsed   = 0.0
         remaining = bat_cap
-        last_idx  = node2idx[0]  # depot index
+        last_idx  = node2idx[0]
         print(f"  Depart depot at t=0.00")
+
+        # 本车充电次数计数
+        charge_count = 0
 
         for node in sub:
             idx      = node2idx[node]
-            # 1) 飞行到下一个节点
+            # 飞行到下一个节点
             dist     = D[last_idx][idx]
             t_fly    = dist / speed
             arrival  = elapsed + t_fly
             remaining -= dist * energy_km
 
             if isinstance(node, int):
-                # 客户节点：打印到达时间 + 服务
+                # 客户节点
                 print(f"    -> Customer {node} at t={arrival:.2f}")
                 service = instance[f'customer_{node}']['service_time']
                 elapsed = arrival + service
             else:
-                # 充电站节点：打印到达时间
+                # 充电站节点
                 sid = node.split('_', 1)[1]
                 print(f"    -> Station {sid} at t={arrival:.2f}", end='')
 
-                # 2) 动态计算充电时间
+                # 动态计算充电时间
                 need_charge = bat_cap - remaining
                 t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
 
+                # 统计
+                charge_count += 1
 
-                # 打印充电时长
                 print(f", charging for {t_charge:.2f}")
-                # 累加充电时间并恢复电量
                 elapsed   = arrival + t_charge
                 remaining = bat_cap
 
             last_idx = idx
 
-        # 返回 depot
+        # 回仓段
         back_dist = D[last_idx][ node2idx[0] ]
         t_back    = back_dist / speed
-        print(f"    -> Return depot at t={elapsed + t_back:.2f}\n")
+        finish_t  = elapsed + t_back
+        print(f"    -> Return depot at t={finish_t:.2f}\n")
+
+        # 记录本车充电次数
+        per_vehicle_counts.append(charge_count)
+        total_charge_count += charge_count
+
+    # 输出统计结果
+    vehicle_num = len(route)
+    avg_charge_per_vehicle = total_charge_count / vehicle_num if vehicle_num > 0 else 0
+    print(f"Total charging events: {total_charge_count}")
+    print(f"Average charging events per vehicle: {avg_charge_per_vehicle:.2f}")
