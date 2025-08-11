@@ -1,7 +1,7 @@
 
 import random
 from algorithm.core import run_gavrptw
-from algorithm.core import run_gavrptw_with_stations
+from algorithm.core import run_gavrptw_always_charge
 
 def test_run_gavrptw_executes():
     """
@@ -10,7 +10,7 @@ def test_run_gavrptw_executes():
     random.seed(64)
     instance_name = 'Jialong_Yang_customize'
 
-    run_gavrptw_with_stations(
+    run_gavrptw_always_charge(
         instance_name=instance_name,
         unit_cost=8.0,
         init_cost=100.0,

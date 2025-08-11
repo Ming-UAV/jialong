@@ -356,15 +356,10 @@
         ]
     ],
     "instance_name": "C106",
-    "max_vehicle_number": 25,
     "station_1": {
         "coordinates": {
             "x": 40.0,
             "y": 50.0
         }
-    },
-    "vehicle_capacity": 200.0,
-    "vehicle_charge_rate": 2.0,
-    "vehicle_degradation_rate": 0.05,
-    "vehicle_speed": 2.0
+    }
 }

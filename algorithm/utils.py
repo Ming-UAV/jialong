@@ -167,12 +167,15 @@ def text3json(customize=False):
                     continue
 
                 # 2) Vehicle + battery info (两列数字)
-                if head.isdigit() and len(parts) == 5 and 'max_vehicle_number' not in json_data:
+                if head.isdigit() and len(parts) == 6 and 'max_vehicle_number' not in json_data:
                     json_data['max_vehicle_number'] = int(parts[0])
                     json_data['vehicle_capacity']   = float(parts[1])
                     json_data['vehicle_speed'] = float(parts[2])
                     json_data['vehicle_charge_rate'] = float(parts[3])
-                    json_data['vehicle_degradation_rate'] = float(parts[4])
+                    json_data['vehicle_vertical_energy_consume'] = float(parts[4])
+                    json_data['vehicle_initial_payload'] =float(parts[5])
+
+
                     continue
 
                 # 3) 充电站行： station ID X Y

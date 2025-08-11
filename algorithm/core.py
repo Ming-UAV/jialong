@@ -468,14 +468,21 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
     speed = instance['vehicle_speed']  # 直接读 JSON 里定义的 speed
     max_e = instance['vehicle_capacity']
     charge_rt = instance['vehicle_charge_rate']
-    degr_rt = instance['vehicle_degradation_rate']
-
+    energy_vertical = instance['vehicle_vertical_energy_consume']
+    pay_cap = instance.get('payload_capacity', instance['vehicle_initial_payload'])
     e_left = max_e
     t_elapsed = 0.0
     last_idx = 0   # depot == index 0
-
+    payload_left = pay_cap
     route = []
     sub = []
+    k_payload =0.3
+    def rate(payload_now: float) -> float:
+        # 线性模型：base * (1 + k * 载荷占比)，k≥0 时“越重越费电”
+        # 你也可以换成 base + a*payload_now 的形式
+        frac = 0.0 if pay_cap <= 0 else max(0.0, payload_now) / pay_cap
+        return energy_per_km * (1+ k_payload * frac)
+
     # —— 0) 先算出每个 customer 返回“最近充电站”的最小距离 —— #
     # stat_idxs 是所有 station 在矩阵里的索引
     stat_idxs = [key2idx[s] for s in stat_keys]
@@ -492,15 +499,18 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
         d1 = D[last_idx][cidx]
         d2 = D[cidx][0]
         d2_station = nearest_station_dist[cidx]
-        need_dir = (d1 + d2_station) * energy_per_km
+        demand = instance[ckey]['demand']  # ★ 该点要投放的载荷
+
+        need_dir = d1 * rate(payload_left) + d2_station * rate(payload_left - demand)
         arr_t = t_elapsed + d1/speed
         ret_t = arr_t + instance[ckey]['service_time'] + d2/speed
 
-        if e_left >= need_dir :
+        if e_left >= need_dir and (payload_left - demand >= 0) :
             sub.append(cid)
-            e_left -= need_dir
+            e_left  -= d1 * rate(payload_left)
             t_elapsed = arr_t + instance[ckey]['service_time']
             last_idx = cidx
+            payload_left -= demand  # ★ 扣减载荷
             continue
         stations_sorted = sorted(
             stat_keys,
@@ -515,13 +525,13 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
             sidx = key2idx[skey]
             d_ls = D[last_idx][sidx]
             d_sc = D[sidx][cidx]
-            need_via = (d_ls ) * energy_per_km
+            need_via = d_ls * rate(payload_left)
             arr_v = t_elapsed + d_ls/speed + d_sc/speed
             ret_v = arr_v + instance[ckey]['service_time'] + d2/speed
 
-            if e_left >= need_via:
+            if e_left >= need_via and (payload_left - demand >= 0):
                 # 1) 飞到充电站
-                e_left -= need_via
+                e_left   -= d_ls * rate(payload_left)   # ★ 正确扣减
                 t_elapsed += d_ls / speed
                 last_idx = sidx
 
@@ -535,9 +545,10 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
                 sub.append(skey)
 
                 # 4) 飞到客户并服务
-                e_left -= d_sc * energy_per_km
+                e_left   -= d_sc * rate(payload_left)   # ★ 仍按投放前载荷
                 t_elapsed += d_sc / speed
                 t_elapsed += instance[ckey]['service_time']
+                payload_left -= demand  # ★ 在客户点扣减载荷
                 sub.append(cid)
                 last_idx = cidx
 
@@ -552,7 +563,8 @@ def ind2route_with_stations(individual, instance, energy_per_km: float = 1.0,):
             route.append(sub)
         sub = [cid]
         d0c = D[0][cidx]
-        e_left = max_e - d0c*energy_per_km
+        e_left       = max_e - d0c * rate(pay_cap)
+        payload_left = pay_cap - demand  # ★ 新航线从满载减去首单
         t_elapsed = d0c/speed + instance[ckey]['service_time']
         last_idx = cidx
 
@@ -621,112 +633,121 @@ def eval_vrptw_with_stations(individual, instance,
 
 
 
-def eval_vrptw_with_stations_chargingtime (individual, instance,
+def eval_vrptw_with_stations_chargingtime(individual, instance,
                              unit_cost=1.0, init_cost=0.0,
                              wait_cost=0.0, delay_cost=0.0,
-                             energy_per_km=1.0):
+                             energy_per_km=1.0,
+                             decoder_fn=None):
     """
-    对带充电站路径进行成本评估。
-    与 eval_vrptw 不同之处在于：
-      - 路径中已包含充电站节点（由 ind2route_with_stations 插入）
-      - 飞行段时间 = distance / vehicle_speed
-      - 充电站节点需计算充电时间并累加到 elapsed
-      - 仅对客户节点计算软时间窗惩罚
-      - 最终成本 = init_cost * (#子航线) + unit_cost * 总距离 + time_penalty
-    返回： (fitness,) ，fitness = 1/total_cost
+    对带充电站路径进行成本评估（能耗随载荷变化）：
+      rate(payload) = energy_per_km * (1 + k_payload * (payload / payload_cap))
+
+    - 路径由 decoder_fn 解码（若 None 则使用 ind2route_with_stations）
+    - 飞行时间 = 距离 / 速度
+    - 充电站：按补满所需电量计充电时间
+    - 仅对客户节点计算时间窗惩罚
+    - 每条子航线以“满电 + 满载”起始
+    返回：(fitness,) ，fitness = 1 / total_cost
     """
 
-    # 1. 全局参数读取
-    speed     = instance['vehicle_speed']               # 车辆飞行速度
-    bat_cap   = instance['vehicle_capacity']         # 电池满电量
-    charge_rt = instance['vehicle_charge_rate']      # 充电速率（电量单位/时间单位）
+    # —— 把可能为字符串的数值转 float，避免类型错误 —— #
+    def f(x, default=0.0):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
 
-    # 2. 构建节点到距离矩阵索引的映射
+    # 1) 全局参数
+    speed       = f(instance.get('vehicle_speed', 0.0))
+    bat_cap     = f(instance.get('battery_capacity', instance.get('vehicle_capacity', 0.0)))
+    charge_rt   = f(instance.get('vehicle_charge_rate', 0.0))
+    payload_cap = f(instance.get('vehicle_initial_payload', 0.0))
+    k_payload   = 0.3  # 满载比空载多的能耗比例
+    energy_km   = f(energy_per_km, 1.0)
+
+    # 2) 节点映射
     cust_keys = sorted([k for k in instance if k.startswith('customer_')],
                        key=lambda x: int(x.split('_')[1]))
     stat_keys = sorted([k for k in instance if k.startswith('station_')],
                        key=lambda x: int(x.split('_')[1]))
-    nodes     = ['depart'] + cust_keys + stat_keys
-    key2idx   = {k: i for i, k in enumerate(nodes)}
-    D         = instance['distance_matrix']
+    nodes   = ['depart'] + cust_keys + stat_keys
+    key2idx = {k: i for i, k in enumerate(nodes)}
+    D       = instance['distance_matrix']
 
-    # 3. 解码：获得含充电站的子航线列表
-    routes = ind2route_with_stations(individual, instance, energy_per_km)
+    # 3) 解码（支持自定义解码器）
+    if decoder_fn is None:
+        routes = ind2route_with_stations(individual, instance, energy_km)
+    else:
+        routes = decoder_fn(individual, instance, energy_km)
+
+    # 4) 载荷相关单位里程能耗
+    def rate(payload_now: float) -> float:
+        frac = 0.0 if payload_cap <= 0 else max(0.0, payload_now) / payload_cap
+        return energy_km * (1.0 + k_payload * frac)
 
     total_cost = 0.0
 
-    # 4. 遍历每条子航线进行成本计算
+    # 5) 逐条子航线评估
     for sub in routes:
-        dist      = 0.0     # 累计飞行距离成本部分
-        time_pen  = 0.0     # 累计客户时间窗惩罚
-        elapsed   = 0.0     # 子航线内部的时序进度
-        remaining = bat_cap # 当前剩余电量
-        last_idx  = key2idx['depart']
-
+        dist         = 0.0        # 距离成本
+        time_pen     = 0.0        # 时间窗惩罚
+        elapsed      = 0.0        # 子航线内累计时间
+        remaining    = bat_cap    # 剩余电量
+        payload_left = payload_cap # 剩余载荷（子航线起始满载）
+        last_idx     = key2idx['depart']
 
         for node in sub:
-            # —— 飞行段 —— #
-            # 找到下一个节点在矩阵中的索引
-            if isinstance(node, str):
-                # node 本身就是 'station_X'
+            # 下一节点索引
+            if isinstance(node, str):      # 'station_X'
                 idx = key2idx[node]
-            else:
-                # node 是客户编号的整数，要拼出 'customer_<node>'
+            else:                          # 客户 int
                 idx = key2idx[f'customer_{node}']
-            # 读取两点距离
-            d   = D[last_idx][idx]
-            dist += d
-            # 耗电 = 距离 * 单位耗电率
-            remaining -= d * energy_per_km
-            # 飞行时间 = 距离 / 速度
-            t_fly   = d / speed
+
+            # —— 飞行段 —— #
+            d        = D[last_idx][idx]
+            dist    += d
+            # 按本段起飞时的载荷扣能量
+            remaining -= d * rate(payload_left)
+            # 飞行时间
+            t_fly   = d / speed if speed > 0 else 0.0
             arrival = elapsed + t_fly
 
             if isinstance(node, str):
-                # —— 充电站节点 —— #
-                # 1) （可选）时间窗惩罚
-                ready = instance[node].get('ready_time', 0.0)
-                due   = instance[node].get('due_time', float('inf'))
-                time_pen += wait_cost * max(ready - arrival, 0) \
-                          + delay_cost * max(arrival - due, 0)
+                # —— 充电站 —— #
+                ready = f(instance[node].get('ready_time', 0.0))
+                due   = f(instance[node].get('due_time', float('inf')))
+                time_pen += wait_cost * max(ready - arrival, 0.0) \
+                          + delay_cost * max(arrival - due, 0.0)
 
-                # 2) 动态充电：补满电所需时间
-                need_charge = bat_cap - remaining
-                t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
-
-                # 累加充电时间
-                elapsed   = arrival + t_charge
-                # 电量回满
-                remaining = bat_cap
+                need_charge = max(0.0, bat_cap - remaining)
+                t_charge    = (need_charge / charge_rt) if (charge_rt > 0 and need_charge > 0) else 0.0
+                elapsed     = arrival + t_charge
+                remaining   = bat_cap      # 充满
+                # 载荷不变
 
             else:
-                # —— 客户节点 —— #
-                # 1) 时间窗软惩罚
-                key = f'customer_{node}'
-                ready = instance[key]['ready_time']
-                due   = instance[key]['due_time']
-                time_pen += wait_cost * max(ready - arrival, 0) \
-                          + delay_cost * max(arrival - due, 0)
+                # —— 客户 —— #
+                key     = f'customer_{node}'
+                ready   = f(instance[key].get('ready_time', 0.0))
+                due     = f(instance[key].get('due_time', float('inf')))
+                service = f(instance[key].get('service_time', 0.0))
+                demand  = f(instance[key].get('demand', 0.0))
 
-                # 2) 服务时间累加
-                service = instance[key]['service_time']
-                elapsed = arrival + service
+                time_pen += wait_cost * max(ready - arrival, 0.0) \
+                          + delay_cost * max(arrival - due, 0.0)
 
-            # 更新当前位置
+                elapsed      = arrival + service
+                payload_left = payload_left - demand  # 服务后投放，载荷减少
+
             last_idx = idx
 
-        # —— 回仓段 —— #
-        # 回到仓库的距离成本
+        # —— 回仓：与你原逻辑一致，仅计距离成本 —— #
         dist += D[last_idx][ key2idx['depart'] ]
-        # 子航线总成本 = init_cost + unit_cost*dist + time_pen
         total_cost += init_cost + unit_cost * dist + time_pen
 
-    # 防除零
     if total_cost <= 0:
         return (float('inf'),)
-    # 适应度 = 1 / 总成本
     return (1.0 / total_cost,)
-
 
 # 3) GA 主流程改造
 def run_gavrptw_with_stations(instance_name,
@@ -757,7 +778,8 @@ def run_gavrptw_with_stations(instance_name,
                 init_cost=init_cost,
                 wait_cost=wait_cost,
                 delay_cost=delay_cost,
-                energy_per_km=energy_per_km)
+                energy_per_km=energy_per_km
+                )
     tb.register('select', tools.selRoulette)
     tb.register('mate', cx_partially_matched)
     tb.register('mutate', mut_inverse_indexes)
@@ -902,72 +924,31 @@ def plot_vrptw_routes_with_stations(instance_name,
 
 
 
-def print_route_with_times(route, instance):
-    """
-    打印每条子航线，并显示到达每个客户/站点时刻，
-    并且正确区分客户编号和站点编号在 distance_matrix 中的行列位置。
-    同时将距离除以 instance['vehicle_speed'] 得到的时间用来计算 arrival。
-    """
-    D = instance['distance_matrix']
-    speed = instance.get('vehicle_speed', 1.0)  # 默认 1
-
-    # 1) 构建节点顺序：0（仓库） + 所有客户升序 + 所有站点升序
-    cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
-    station_ids = sorted(int(k.split('_')[1]) for k in instance if k.startswith('station_'))
-    node2idx = {0: 0}
-    # 客户从 1 开始
-    for i, cid in enumerate(cust_ids, start=1):
-        node2idx[cid] = i
-    # 站点接着客户编号后面
-    for j, sid in enumerate(station_ids, start=1 + len(cust_ids)):
-        node2idx[f'station_{sid}'] = j
-
-    for vid, sub in enumerate(route, start=1):
-        print(f"Vehicle {vid}:")
-        elapsed   = 0.0
-        last_idx  = node2idx[0]  # depot 的矩阵索引
-        print(f"  Depart depot at t=0.00")
-        for node in sub:
-            idx      = node2idx[node]
-            distance = D[last_idx][idx]
-            t_travel = distance / speed      # ← 用速度换算时间
-            arrival  = elapsed + t_travel
-
-            if isinstance(node, int):
-                # 客户节点
-                print(f"    -> Customer {node} at t={arrival:.2f}")
-                service = instance[f'customer_{node}']['service_time']
-                elapsed = arrival + service
-            else:
-                # 站点节点 'station_X'
-                sid = node.split('_', 1)[1]
-                print(f"    -> Station {sid} at t={arrival:.2f}")
-                # 如果站点存在固定充电时间，则加上：
-                # charge = instance[f'station_{sid}'].get('charge_time', 0.0)
-                # elapsed = arrival + charge
-                elapsed = arrival
-
-            last_idx = idx
-
-        # 回到 depot
-        back_dist = D[last_idx][ node2idx[0] ]
-        t_back    = back_dist / speed        # ← 同样要除以速度
-        print(f"    -> Return depot at t={elapsed + t_back:.2f}\n")
-
 
 def print_route_with_times_chargingtime(route, instance, energy_per_km):
     """
-    打印每条子航线，并显示到达每个客户/站点时刻，
-    正确区分客户编号和站点编号，并动态加上充电时间。
-    并输出总的充电次数和每台无人机的平均充电次数。
-    """
-    D          = instance['distance_matrix']
-    speed      = instance['vehicle_speed']
-    bat_cap    = instance['vehicle_capacity']
-    charge_rt  = instance['vehicle_charge_rate']
-    energy_km  = energy_per_km
+    打印每条子航线：到达时间 / 充电时间 / 剩余载荷 / SOC，
+    并考虑单位里程能耗随载荷变化：
+      rate = energy_per_km * (1 + k_payload * (payload_left / payload_cap))
 
-    # 构建矩阵索引映射：0=depot, 1..=customers, then stations
+    额外汇总：
+      - Total energy consumed（总能量消耗，单位与 vehicle_capacity 一致）
+      - Mission completion time / makespan（完成全部任务的时间，所有车辆并行执行时的最大完成时刻）
+    """
+    D           = instance['distance_matrix']
+    speed       = instance['vehicle_speed']
+    bat_cap     = instance['vehicle_capacity']           # 电池容量
+    charge_rt   = instance['vehicle_charge_rate']
+    payload_cap = instance['vehicle_initial_payload']    # 载荷上限
+    k_payload   = 0.3                                    # 载荷能耗系数（0=忽略载荷影响）
+    energy_km   = float(energy_per_km)                   # 空载/基准每公里能耗
+
+    # 单位里程能耗率：随当前载荷线性变化
+    def rate(payload_now: float) -> float:
+        frac = 0.0 if payload_cap <= 0 else max(0.0, payload_now) / payload_cap
+        return energy_km * (1.0 + k_payload * frac)
+
+    # 0=depot, 1..=customers, then stations
     cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
     station_ids = sorted(int(k.split('_')[1]) for k in instance if k.startswith('station_'))
     node2idx    = {0: 0}
@@ -976,43 +957,67 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
     for j, sid in enumerate(station_ids, start=1 + len(cust_ids)):
         node2idx[f'station_{sid}'] = j
 
-    total_charge_count = 0
-    per_vehicle_counts = []
+    total_charge_count   = 0
+    per_vehicle_counts   = []
+    total_energy         = 0.0     # ★ 所有无人机的总能耗（飞行段能量之和）
+    mission_makespan     = 0.0     # ★ 全部任务完成时间（并行时取最大完成时刻）
 
     for vid, sub in enumerate(route, start=1):
         print(f"Vehicle {vid}:")
-        elapsed   = 0.0
-        remaining = bat_cap
-        last_idx  = node2idx[0]
-        print(f"  Depart depot at t=0.00")
+        elapsed       = 0.0
+        remaining     = bat_cap           # 剩余电量
+        last_idx      = node2idx[0]
+        payload_left  = payload_cap       # 剩余载荷（子航线出发时满载）
+        veh_energy    = 0.0               # ★ 该车能耗统计
+        print(f"  Depart depot at t=0.00, payload={payload_left}, SOC={remaining:.2f}/{bat_cap:.2f}")
 
-        # 本车充电次数计数
         charge_count = 0
 
         for node in sub:
-            idx      = node2idx[node]
-            # 飞行到下一个节点
-            dist     = D[last_idx][idx]
-            t_fly    = dist / speed
-            arrival  = elapsed + t_fly
-            remaining -= dist * energy_km
+            idx   = node2idx[node]
+            dist  = D[last_idx][idx]
+            t_fly = dist / speed
+
+            # ★ 扣“这一段”的能耗：按起飞时的当前载荷，并累计总能耗
+            hop_energy  = dist * rate(payload_left)
+            remaining  -= hop_energy
+            total_energy += hop_energy
+            veh_energy  += hop_energy
+
+            arrival = elapsed + t_fly
+            if remaining < -1e-9:
+                print(f"    [WARN] energy below 0 after hop: {remaining:.2f}")
 
             if isinstance(node, int):
-                # 客户节点
-                print(f"    -> Customer {node} at t={arrival:.2f}")
+                # 客户节点：服务后投放，载荷减少
+                demand  = instance[f'customer_{node}']['demand']
                 service = instance[f'customer_{node}']['service_time']
-                elapsed = arrival + service
+                new_payload = payload_left - demand
+
+                if new_payload < 0:
+                    print(f"    -> Customer {node} at t={arrival:.2f}  "
+                          f"[WARN: demand {demand} > payload_left {payload_left}]  "
+                          f"SOC={remaining:.2f}/{bat_cap:.2f}")
+                else:
+                    print(f"    -> Customer {node} at t={arrival:.2f}, "
+                          f"drop={demand}, payload_left={new_payload}, "
+                          f"SOC={remaining:.2f}/{bat_cap:.2f}")
+
+                payload_left = new_payload
+                elapsed      = arrival + service
+
             else:
-                # 充电站节点
+                # 充电站节点：只充电，不改载荷
                 sid = node.split('_', 1)[1]
-                print(f"    -> Station {sid} at t={arrival:.2f}", end='')
+                print(f"    -> Station {sid} at t={arrival:.2f}, "
+                      f"payload_left={payload_left}, SOC={remaining:.2f}/{bat_cap:.2f}", end='')
 
-                # 动态计算充电时间
-                need_charge = bat_cap - remaining
-                t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
-
-                # 统计
-                charge_count += 1
+                need_charge = max(0.0, bat_cap - remaining)
+                if need_charge > 0 and charge_rt > 0:
+                    t_charge = need_charge / charge_rt
+                    charge_count += 1
+                else:
+                    t_charge = 0.0
 
                 print(f", charging for {t_charge:.2f}")
                 elapsed   = arrival + t_charge
@@ -1020,18 +1025,271 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
 
             last_idx = idx
 
-        # 回仓段
+        # 回仓：也按当前剩余载荷计能耗，并计入总能耗
         back_dist = D[last_idx][ node2idx[0] ]
         t_back    = back_dist / speed
-        finish_t  = elapsed + t_back
-        print(f"    -> Return depot at t={finish_t:.2f}\n")
+        back_energy = back_dist * rate(payload_left)
+        remaining  -= back_energy
+        total_energy += back_energy
+        veh_energy   += back_energy
 
-        # 记录本车充电次数
+        finish_t  = elapsed + t_back
+        mission_makespan = max(mission_makespan, finish_t)   # ★ 更新任务完成时间
+        print(f"    -> Return depot at t={finish_t:.2f}, payload_left={payload_left}, "
+              f"SOC={remaining:.2f}/{bat_cap:.2f}  |  energy_used={veh_energy:.2f}\n")
+
         per_vehicle_counts.append(charge_count)
         total_charge_count += charge_count
 
-    # 输出统计结果
     vehicle_num = len(route)
     avg_charge_per_vehicle = total_charge_count / vehicle_num if vehicle_num > 0 else 0
+
     print(f"Total charging events: {total_charge_count}")
     print(f"Average charging events per vehicle: {avg_charge_per_vehicle:.2f}")
+    print(f"Total energy consumed: {total_energy:.2f}")              # ★ 总能量消耗
+    print(f"Mission completion time (makespan): {mission_makespan:.2f}")  # ★ 完成全部任务的时间
+
+    # 可选：把汇总返回，方便上层使用
+    return {
+        "total_energy": total_energy,
+        "mission_makespan": mission_makespan,
+        "total_charging_events": total_charge_count,
+        "avg_charging_per_vehicle": avg_charge_per_vehicle,
+    }
+
+
+
+def ind2route_always_charge(individual, instance, energy_per_km: float = 1.0):
+    """
+    解码：每服务完一个客户，必定飞到“最近充电站”并充满，再继续下一个客户。
+    若从当前位置无法满足“到客户 + 客户到最近站”的能量需求，或载荷不足，
+    则结束当前子航线，开启新子航线（从仓库满载、满电出发）。
+
+    路由表示：客户用 int，充电站用 'station_<id>' 字符串。
+    能耗：rate(payload) = energy_per_km * (1 + k_payload * (payload/pay_cap)).
+    """
+    # -------- 安全取值并转成 float，避免 JSON 里是字符串导致类型错误 --------
+    def f(x, default=0.0):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
+
+    # 1) 节点映射
+    cust_keys = sorted([k for k in instance if k.startswith('customer_')],
+                       key=lambda x: int(x.split('_')[1]))
+    stat_keys = sorted([k for k in instance if k.startswith('station_')],
+                       key=lambda x: int(x.split('_')[1]))
+    if not stat_keys:
+        raise ValueError("ind2route_always_charge 需要至少 1 个 station_* 节点。")
+
+    nodes   = ['depart'] + cust_keys + stat_keys
+    key2idx = {k: i for i, k in enumerate(nodes)}
+
+    D         = instance['distance_matrix']
+    speed     = f(instance.get('vehicle_speed', 0.0))
+    max_e     = f(instance.get('vehicle_capacity', instance.get('battery_capacity', 0.0)))
+    charge_rt = f(instance.get('vehicle_charge_rate', 0.0))
+    pay_cap   = f(instance.get('payload_capacity',
+                     instance.get('vehicle_initial_payload', instance.get('payload', 0.0))))
+    k_payload = 0.3
+    base_rate = f(energy_per_km, 1.0)
+
+    # 2) 载荷相关单位里程能耗
+    def rate(payload_now: float) -> float:
+        frac = 0.0 if pay_cap <= 0 else max(0.0, payload_now) / pay_cap
+        return base_rate * (1.0 + k_payload * frac)
+
+    # 3) 预计算：每个客户最近的充电站（索引与键名）
+    stat_idxs = [key2idx[s] for s in stat_keys]
+    nearest_station_idx = {}
+    nearest_station_key = {}
+    for ckey in cust_keys:
+        cidx = key2idx[ckey]
+        # 选距离最小的站
+        sidx = min(stat_idxs, key=lambda si: D[cidx][si])
+        nearest_station_idx[cidx] = sidx
+        nearest_station_key[cidx] = nodes[sidx]  # 形如 'station_3'
+
+    # 4) 主循环
+    route, sub = [], []
+    last_idx = 0        # 从仓库出发
+    e_left   = max_e
+    payload_left = pay_cap
+    t_elapsed = 0.0     # 目前只累积，不做时间窗约束
+
+    for cid in individual:
+        ckey = f'customer_{cid}'
+        cidx = key2idx[ckey]
+        demand = f(instance[ckey]['demand'])
+
+        if demand > pay_cap:
+            raise ValueError(f"客户 {cid} 需求({demand}) 超过载荷上限({pay_cap})。")
+
+        sidx = nearest_station_idx[cidx]        # 该客户最近站
+        skey = nearest_station_key[cidx]
+
+        # 定义一个尝试函数：从当前 last_idx 出发，去客户并再去最近站
+        def can_do_from_here(e_now: float, payload_now: float) -> bool:
+            d_last_c = D[last_idx][cidx]     # last -> customer
+            d_c_s    = D[cidx][sidx]         # customer -> nearest station
+            need     = d_last_c * rate(payload_now) + d_c_s * rate(payload_now - demand)
+            return (e_now >= need) and (payload_now - demand >= 0)
+
+        # 如果从当前基点/剩余能量无法完成“到客户+到站”，则开新子航线从仓库出发
+        if not can_do_from_here(e_left, payload_left):
+            if sub:
+                route.append(sub)
+            # 重置为新子航线（新车满载、满电、从仓库起飞）
+            sub = []
+            last_idx = 0
+            e_left   = max_e
+            payload_left = pay_cap
+            t_elapsed = 0.0
+            # 再次检查从仓库是否可行，不可行则认为参数设置不合理
+            if not can_do_from_here(e_left, payload_left):
+                d0c = D[0][cidx]; dcs = D[cidx][sidx]
+                need_dbg = d0c * rate(pay_cap) + dcs * rate(pay_cap - demand)
+                raise ValueError(
+                    f"从仓库出发也无法完成 客户{cid} -> 最近站 的能量需求，"
+                    f"需能量≈{need_dbg:.3f} > 电池容量 {max_e:.3f}。"
+                )
+
+        # —— 执行：last -> customer
+        d_last_c = D[last_idx][cidx]
+        e_left  -= d_last_c * rate(payload_left)
+        t_elapsed += d_last_c / speed
+        # 记录客户
+        sub.append(cid)
+        # 服务并投放
+        service_time = f(instance[ckey]['service_time'])
+        t_elapsed += service_time
+        payload_left -= demand
+
+        # —— 必定去最近充电站
+        d_c_s = D[cidx][sidx]
+        e_left  -= d_c_s * rate(payload_left)     # 注意：已投放后的载荷
+        t_elapsed += d_c_s / speed
+        # 插入站点标记
+        sub.append(skey)
+        last_idx = sidx
+
+        # 充电至满
+        need_charge = max_e - e_left
+        t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
+        t_elapsed  += t_charge
+        e_left      = max_e
+
+        # 注意：不在站点补载荷；载荷只会递减到 0，如不足将触发新子航线
+
+    # 收尾
+    if sub:
+        route.append(sub)
+    return route
+
+def run_gavrptw_always_charge(instance_name,
+                              unit_cost, init_cost, wait_cost, delay_cost,
+                              ind_size, pop_size, cx_pb, mut_pb, n_gen,
+                              energy_per_km=1.0,
+                              export_csv=False, customize_data=False):
+    """
+    GA 主流程（每服务完一个客户必去最近充电站充满的解码逻辑）
+    - 评估函数：eval_vrptw_with_stations_chargingtime（能耗随载荷变化）
+    - 解码器：ind2route_always_charge（客户 -> 最近站 -> 客户 -> 最近站 ...）
+    """
+
+    # --- 加载实例 ---
+    json_dir  = os.path.join(BASE_DIR, 'data', 'json_customize' if customize_data else 'json')
+    inst_file = os.path.join(json_dir, f'{instance_name}.json')
+    instance  = load_instance(inst_file)
+    if instance is None:
+        print(f"❌ 找不到 {inst_file}")
+        return
+
+    # --- DEAP 注册（避免重复注册报错） ---
+    try:
+        creator.create('FitnessMax', base.Fitness, weights=(1.0,))
+    except Exception:
+        pass
+    try:
+        creator.create('Individual', list, fitness=creator.FitnessMax)
+    except Exception:
+        pass
+
+    tb = base.Toolbox()
+    tb.register('idx', random.sample, range(1, ind_size + 1), ind_size)
+    tb.register('ind', tools.initIterate, creator.Individual, tb.idx)
+    tb.register('pop', tools.initRepeat, list, tb.ind)
+
+    # 评估：使用“必到站”的解码器，并考虑载荷影响能耗
+    tb.register('evaluate', eval_vrptw_with_stations_chargingtime,
+                instance=instance,
+                unit_cost=unit_cost,
+                init_cost=init_cost,
+                wait_cost=wait_cost,
+                delay_cost=delay_cost,
+                energy_per_km=float(energy_per_km),
+                decoder_fn=ind2route_always_charge)
+
+    tb.register('select', tools.selRoulette)
+    tb.register('mate', cx_partially_matched)
+    tb.register('mutate', mut_inverse_indexes)
+
+    # --- 初始种群与打分 ---
+    pop = tb.pop(n=pop_size)
+    for ind in pop:
+        ind.fitness.values = tb.evaluate(ind)
+
+    stats = []
+    # --- 演化 ---
+    for gen in range(n_gen):
+        off = tb.select(pop, len(pop))
+        off = list(map(tb.clone, off))
+
+        # 交叉
+        for c1, c2 in zip(off[::2], off[1::2]):
+            if random.random() < cx_pb:
+                tb.mate(c1, c2)
+                del c1.fitness.values; del c2.fitness.values
+
+        # 变异
+        for m in off:
+            if random.random() < mut_pb:
+                tb.mutate(m)
+                del m.fitness.values
+
+        # 重新评估
+        invalid = [i for i in off if not i.fitness.valid]
+        for i in invalid:
+            i.fitness.values = tb.evaluate(i)
+        pop[:] = off
+
+        if export_csv:
+            fits = [i.fitness.values[0] for i in pop]
+            avg  = sum(fits)/len(fits)
+            std  = (sum(x*x for x in fits)/len(fits) - avg*avg)**0.5
+            stats.append({'gen': gen, 'min': min(fits), 'max': max(fits), 'avg': avg, 'std': std})
+
+    # --- 最优个体与展示（同一个解码器，保证一致） ---
+    best = tools.selBest(pop, 1)[0]
+    print(f"最佳染色体: {best}")
+    print(f"适应度: {best.fitness.values[0]}")
+
+    best_routes = ind2route_always_charge(best, instance, float(energy_per_km))
+    print_route(best_routes)
+    print_route_with_times_chargingtime(best_routes, instance, float(energy_per_km))
+    plot_vrptw_routes_with_stations(instance_name, best_routes,
+                                    customize=customize_data, save_image=True)
+
+    # --- 导出 CSV ---
+    if export_csv and stats:
+        out = os.path.join(BASE_DIR, 'results',
+                           f"{instance_name}_always_charge_ec{energy_per_km}.csv")
+        make_dirs_for_file(out)
+        with io.open(out, 'wt', encoding='utf-8', newline='') as f:
+            w = DictWriter(f, fieldnames=list(stats[0].keys()))
+            w.writeheader()
+            for r in stats:
+                w.writerow(r)
+
+    return best, best_routes

@@ -11827,7 +11827,6 @@
         ]
     ],
     "instance_name": "fly_grassland_100",
-    "max_vehicle_number": 25,
     "station_1": {
         "coordinates": {
             "x": 60.4545,
@@ -11839,9 +11838,5 @@
             "x": 54.1333,
             "y": 45.0
         }
-    },
-    "vehicle_capacity": 56.1,
-    "vehicle_charge_rate": 56.1,
-    "vehicle_degradation_rate": 0.05,
-    "vehicle_speed": 61.2
+    }
 }

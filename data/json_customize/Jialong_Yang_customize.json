@@ -886,7 +886,8 @@
             0.0
         ]
     ],
-    "instance_name": "fly_grassland",
+    "instance_name": "Jialong_Yang_customize",
+    "max_vehicle_number": 1,
     "station_1": {
         "coordinates": {
             "x": 21.75,
@@ -910,5 +911,10 @@
             "x": 12.5,
             "y": 47.5
         }
-    }
+    },
+    "vehicle_capacity": 500.0,
+    "vehicle_charge_rate": 56.1,
+    "vehicle_initial_payload": 500.0,
+    "vehicle_speed": 61.2,
+    "vehicle_vertical_energy_consume": 5.0
 }
