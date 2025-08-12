@@ -945,11 +945,13 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
     同时加入“最大连续飞行里程”强制落地逻辑：
       - 阈值：instance['max_continuous_km']（缺省 3.6）
       - 每触发一次落地，扣除 instance['vehicle_vertical_energy_consume'] 能量
-      - 不额外计时（与解码器一致）
+      - 不额外计时（与当前解码器一致：只扣能量，不加时间）
 
     额外汇总：
-      - Total energy consumed
-      - Mission completion time / makespan
+      - Total energy consumed（所有无人机飞行+强制落地的能量之和）
+      - Mission completion time / makespan（并行车辆的最大完成时刻）
+      - Total/Avg charging events（总/平均充电次数）
+      - Total/Avg forced landings（总/平均强制落地次数）
     """
     # —— 安全取 float —— #
     def f(x, default=0.0):
@@ -958,26 +960,29 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
         except (TypeError, ValueError):
             return default
 
-    D            = instance['distance_matrix']
-    speed        = f(instance.get('vehicle_speed', 0.0))
-    bat_cap      = f(instance.get('vehicle_capacity', 0.0))           # 电池容量
-    charge_rt    = f(instance.get('vehicle_charge_rate', 0.0))
-    payload_cap  = f(instance.get('vehicle_initial_payload', 0.0))    # 载荷上限
+    # 读取参数
+    D             = instance['distance_matrix']
+    speed         = f(instance.get('vehicle_speed', 0.0))
+    bat_cap       = f(instance.get('vehicle_capacity', instance.get('battery_capacity', 0.0)))
+    charge_rt     = f(instance.get('vehicle_charge_rate', 0.0))
+    payload_cap   = f(instance.get('vehicle_initial_payload', 0.0))
+    k_payload     = 0.3                               # 载荷能耗系数
+    energy_km     = f(energy_per_km, 1.0)
     landing_energy = f(instance.get('vehicle_vertical_energy_consume', 0.0))
-    max_cont_km  = f(instance.get('max_continuous_km', 3.6))          # 最大连续飞行里程
-    k_payload    = 0.3                                                 # 载荷能耗系数
-    energy_km    = float(energy_per_km)                                # 空载/基准每公里能耗
+    max_cont_km    = f(instance.get('max_continuous_km', 3.6))
 
     # 单位里程能耗率：随当前载荷线性变化
     def rate(payload_now: float) -> float:
         frac = 0.0 if payload_cap <= 0 else max(0.0, payload_now) / payload_cap
         return energy_km * (1.0 + k_payload * frac)
 
-    # 计算一段距离内需要几次“强制落地”
+    # 计算一段距离内需要几次“强制落地”（只在段内计算，节点到达即落地清零）
     def forced_landings_needed(segment_len: float, since_touch: float) -> int:
         if max_cont_km <= 0:
             return 0
-        return int((since_touch + max(0.0, segment_len)) // max_cont_km)
+        seg = max(0.0, segment_len)
+        # 例如 since_touch=0, segment=7.5, 阈值=3.6 => floor(7.5/3.6)=2
+        return int((since_touch + seg) // max_cont_km)
 
     # 0=depot, 1..=customers, then stations
     cust_ids    = sorted(int(k.split('_')[1]) for k in instance if k.startswith('customer_'))
@@ -993,6 +998,10 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
     total_energy       = 0.0
     mission_makespan   = 0.0
 
+    # ★ 全局强制落地计数（总数 + 每车）
+    total_forced_landings   = 0
+    per_vehicle_forced_list = []
+
     for vid, sub in enumerate(route, start=1):
         print(f"Vehicle {vid}:")
         elapsed        = 0.0
@@ -1001,16 +1010,20 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
         payload_left   = payload_cap
         veh_energy     = 0.0
         charge_count   = 0
-        since_touch    = 0.0  # 自上次“落地”以来已连续飞行里程
+        since_touch    = 0.0  # 自上次“落地”以来的连续飞行里程（到达节点即清零）
 
-        print(f"  Depart depot at t=0.00, payload={payload_left}, SOC={remaining:.2f}/{bat_cap:.2f}")
+        # 该车的强制落地计数
+        veh_forced_landings = 0
+
+        print(f"  Depart depot at t=0.00, payload={payload_left:.2f}, "
+              f"SOC={remaining:.2f}/{bat_cap:.2f}")
 
         for node in sub:
             idx   = node2idx[node]
             dist  = D[last_idx][idx]
             t_fly = dist / speed if speed > 0 else 0.0
 
-            # —— 本段强制落地次数 —— #
+            # —— 本段强制落地次数与额外能量 —— #
             fl = forced_landings_needed(dist, since_touch)
             extra_energy = fl * landing_energy
 
@@ -1022,42 +1035,39 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
             total_energy += (hop_energy + extra_energy)
             veh_energy  += (hop_energy + extra_energy)
 
-            # —— 连续里程更新（到达后先更新，再因“落地”清零）—— #
-            if max_cont_km > 0:
-                since_touch = (since_touch + dist) % max_cont_km
+            # —— 强制落地计数累加 —— #
+            veh_forced_landings += fl
+            total_forced_landings += fl
 
             arrival = elapsed + t_fly
             if remaining < -1e-9:
                 print(f"    [WARN] energy below 0 after hop: {remaining:.2f}")
 
-            # —— 打印强制落地信息 —— #
             if fl > 0:
                 print(f"    [Forced landings: {fl}, extra_energy={extra_energy:.2f}]")
 
+            # —— 到达节点：客户/充电站 —— #
             if isinstance(node, int):
-                # 客户节点：服务后投放，载荷减少；到达即“落地”
+                # 客户：服务后投放，载荷减少；到达即视为“落地”，连续里程清零
                 demand  = f(instance[f'customer_{node}'].get('demand', 0.0))
                 service = f(instance[f'customer_{node}'].get('service_time', 0.0))
                 new_payload = payload_left - demand
 
                 print(f"    -> Customer {node} at t={arrival:.2f}, "
-                      f"drop={demand}, payload_left={max(new_payload,0):.2f}, "
+                      f"drop={demand:.2f}, payload_left={max(new_payload,0):.2f}, "
                       f"SOC={remaining:.2f}/{bat_cap:.2f}")
 
                 payload_left = new_payload
                 elapsed      = arrival + service
-
-                # 到达客户视为“落地”，清零连续里程
-                since_touch = 0.0
-
+                since_touch  = 0.0  # 到达视作落地
             else:
-                # 充电站节点：只充电，不改载荷；到达即“落地”
+                # 充电站：只充电，不改载荷；到达即视为“落地”，连续里程清零
                 sid = node.split('_', 1)[1]
                 print(f"    -> Station {sid} at t={arrival:.2f}, "
                       f"payload_left={payload_left:.2f}, SOC={remaining:.2f}/{bat_cap:.2f}", end='')
 
                 need_charge = max(0.0, bat_cap - remaining)
-                if need_charge > 0 and charge_rt > 0:
+                if need_charge > 1e-12 and charge_rt > 0:
                     t_charge = need_charge / charge_rt
                     charge_count += 1
                 else:
@@ -1066,24 +1076,25 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
                 print(f", charging for {t_charge:.2f}")
                 elapsed   = arrival + t_charge
                 remaining = bat_cap
-
-                # 到站视为“落地”，清零连续里程
-                since_touch = 0.0
+                since_touch = 0.0  # 到达视作落地
 
             last_idx = idx
 
-        # —— 回仓 —— #
+        # —— 回仓（也考虑强制落地能量） —— #
         back_dist = D[last_idx][ node2idx[0] ]
         t_back    = back_dist / speed if speed > 0 else 0.0
 
-        # 回程强制落地
-        fl_back        = forced_landings_needed(back_dist, since_touch)
-        extra_back     = fl_back * landing_energy
-        back_energy    = back_dist * rate(payload_left)
+        fl_back     = forced_landings_needed(back_dist, since_touch)
+        extra_back  = fl_back * landing_energy
+        back_energy = back_dist * rate(payload_left)
 
-        remaining  -= (back_energy + extra_back)
+        remaining   -= (back_energy + extra_back)
         total_energy += (back_energy + extra_back)
-        veh_energy   += (back_energy + extra_back)
+        veh_energy  += (back_energy + extra_back)
+
+        # 回程强制落地计数也要累加
+        veh_forced_landings   += fl_back
+        total_forced_landings += fl_back
 
         finish_t  = elapsed + t_back
         mission_makespan = max(mission_makespan, finish_t)
@@ -1096,12 +1107,16 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
 
         per_vehicle_counts.append(charge_count)
         total_charge_count += charge_count
+        per_vehicle_forced_list.append(veh_forced_landings)
 
     vehicle_num = len(route)
     avg_charge_per_vehicle = total_charge_count / vehicle_num if vehicle_num > 0 else 0.0
+    avg_forced_per_vehicle = total_forced_landings / vehicle_num if vehicle_num > 0 else 0.0
 
     print(f"Total charging events: {total_charge_count}")
     print(f"Average charging events per vehicle: {avg_charge_per_vehicle:.2f}")
+    print(f"Total forced landings: {total_forced_landings}")
+    print(f"Average forced landings per vehicle: {avg_forced_per_vehicle:.2f}")
     print(f"Total energy consumed: {total_energy:.2f}")
     print(f"Mission completion time (makespan): {mission_makespan:.2f}")
 
@@ -1110,26 +1125,26 @@ def print_route_with_times_chargingtime(route, instance, energy_per_km):
         "mission_makespan": mission_makespan,
         "total_charging_events": total_charge_count,
         "avg_charging_per_vehicle": avg_charge_per_vehicle,
+        "total_forced_landings": total_forced_landings,
+        "avg_forced_landings_per_vehicle": avg_forced_per_vehicle,
+        "forced_landings_per_vehicle": per_vehicle_forced_list,
     }
 
 
 def ind2route_always_charge(individual, instance, energy_per_km: float = 1.0):
     """
     解码：每服务完一个客户，必定飞到“最近充电站”并充满，再继续下一个客户。
-    若从当前位置无法满足“到客户 + 客户到最近站”的能量需求，或载荷不足，
-    则结束当前子航线，开启新子航线（从仓库满载、满电出发）。
-
-    路由表示：客户用 int，充电站用 'station_<id>' 字符串。
-    能耗：rate(payload) = energy_per_km * (1 + k_payload * (payload/pay_cap)).
+    加入 3.6 km 连续飞行强制降落：每跨越该阈值一次，扣一次竖直能量（vehicle_vertical_energy_consume）。
     """
-    # -------- 安全取值并转成 float，避免 JSON 里是字符串导致类型错误 --------
+
+    # —— 安全转 float —— #
     def f(x, default=0.0):
         try:
             return float(x)
         except (TypeError, ValueError):
             return default
 
-    # 1) 节点映射
+    # 1) 映射与参数
     cust_keys = sorted([k for k in instance if k.startswith('customer_')],
                        key=lambda x: int(x.split('_')[1]))
     stat_keys = sorted([k for k in instance if k.startswith('station_')],
@@ -1146,31 +1161,42 @@ def ind2route_always_charge(individual, instance, energy_per_km: float = 1.0):
     charge_rt = f(instance.get('vehicle_charge_rate', 0.0))
     pay_cap   = f(instance.get('payload_capacity',
                      instance.get('vehicle_initial_payload', instance.get('payload', 0.0))))
+    landing_energy = f(instance.get('vehicle_vertical_energy_consume', 0.0))
     k_payload = 0.3
     base_rate = f(energy_per_km, 1.0)
+
+    # 连续飞行最大距离阈值（强制落地）：按需求固定 3.6 km
+    max_cont_km = 3.6
 
     # 2) 载荷相关单位里程能耗
     def rate(payload_now: float) -> float:
         frac = 0.0 if pay_cap <= 0 else max(0.0, payload_now) / pay_cap
         return base_rate * (1.0 + k_payload * frac)
 
-    # 3) 预计算：每个客户最近的充电站（索引与键名）
+    # 3) 计算在某段距离内需要触发几次强制落地
+    def forced_landings_needed(segment_len: float, since_touch: float) -> int:
+        if max_cont_km <= 0:
+            return 0
+        seg = max(0.0, segment_len)
+        # 例：since=2.0, seg=2.1, 阈=3.6 => floor((2.0+2.1)/3.6)=1
+        return int((since_touch + seg) // max_cont_km)
+
+    # 4) 预计算每个客户最近的充电站
     stat_idxs = [key2idx[s] for s in stat_keys]
-    nearest_station_idx = {}
-    nearest_station_key = {}
+    nearest_station_idx, nearest_station_key = {}, {}
     for ckey in cust_keys:
         cidx = key2idx[ckey]
-        # 选距离最小的站
         sidx = min(stat_idxs, key=lambda si: D[cidx][si])
         nearest_station_idx[cidx] = sidx
-        nearest_station_key[cidx] = nodes[sidx]  # 形如 'station_3'
+        nearest_station_key[cidx] = nodes[sidx]
 
-    # 4) 主循环
+    # 5) 主循环
     route, sub = [], []
-    last_idx = 0        # 从仓库出发
+    last_idx = 0                        # 从仓库出发
     e_left   = max_e
     payload_left = pay_cap
-    t_elapsed = 0.0     # 目前只累积，不做时间窗约束
+    t_elapsed = 0.0
+    since_touchdown = 0.0              # 自上次“真正落地”以来的连续里程
 
     for cid in individual:
         ckey = f'customer_{cid}'
@@ -1180,66 +1206,85 @@ def ind2route_always_charge(individual, instance, energy_per_km: float = 1.0):
         if demand > pay_cap:
             raise ValueError(f"客户 {cid} 需求({demand}) 超过载荷上限({pay_cap})。")
 
-        sidx = nearest_station_idx[cidx]        # 该客户最近站
+        sidx = nearest_station_idx[cidx]
         skey = nearest_station_key[cidx]
 
-        # 定义一个尝试函数：从当前 last_idx 出发，去客户并再去最近站
-        def can_do_from_here(e_now: float, payload_now: float) -> bool:
-            d_last_c = D[last_idx][cidx]     # last -> customer
-            d_c_s    = D[cidx][sidx]         # customer -> nearest station
-            need     = d_last_c * rate(payload_now) + d_c_s * rate(payload_now - demand)
-            return (e_now >= need) and (payload_now - demand >= 0)
+        # 便捷距离
+        d_last_c = D[last_idx][cidx]   # last -> customer
+        d_c_s    = D[cidx][sidx]       # customer -> nearest station
 
-        # 如果从当前基点/剩余能量无法完成“到客户+到站”，则开新子航线从仓库出发
-        if not can_do_from_here(e_left, payload_left):
+        # 先计算“从当前位置出发”的能量需求（含强制落地）
+        fl_last_c = forced_landings_needed(d_last_c, since_touchdown)
+        fl_c_s    = forced_landings_needed(d_c_s, 0.0)  # 到客户已真正落地，重新计
+        need_here = (
+            d_last_c * rate(payload_left)
+            + d_c_s  * rate(payload_left - demand)
+            + (fl_last_c + fl_c_s) * landing_energy
+        )
+
+        feasible_here = (e_left >= need_here) and (payload_left - demand >= 0)
+
+        if not feasible_here:
+            # 结束当前子航线，换新车（仓库满电满载，since_touchdown 也重置）
             if sub:
                 route.append(sub)
-            # 重置为新子航线（新车满载、满电、从仓库起飞）
             sub = []
             last_idx = 0
             e_left   = max_e
             payload_left = pay_cap
             t_elapsed = 0.0
-            # 再次检查从仓库是否可行，不可行则认为参数设置不合理
-            if not can_do_from_here(e_left, payload_left):
-                d0c = D[0][cidx]; dcs = D[cidx][sidx]
-                need_dbg = d0c * rate(pay_cap) + dcs * rate(pay_cap - demand)
+            since_touchdown = 0.0
+
+            # 从仓库再判断一次
+            d0c  = D[0][cidx]
+            fl_d0c = forced_landings_needed(d0c, 0.0)
+            fl_dcs = forced_landings_needed(d_c_s, 0.0)
+            need_depot = d0c * rate(pay_cap) + d_c_s * rate(pay_cap - demand) \
+                         + (fl_d0c + fl_dcs) * landing_energy
+            if e_left < need_depot:
                 raise ValueError(
-                    f"从仓库出发也无法完成 客户{cid} -> 最近站 的能量需求，"
-                    f"需能量≈{need_dbg:.3f} > 电池容量 {max_e:.3f}。"
+                    f"从仓库也无法完成 客户{cid} -> 最近站 的能量需求，"
+                    f"需≈{need_depot:.3f} > 电池容量 {max_e:.3f}。"
                 )
 
-        # —— 执行：last -> customer
-        d_last_c = D[last_idx][cidx]
-        e_left  -= d_last_c * rate(payload_left)
-        t_elapsed += d_last_c / speed
-        # 记录客户
+            # 既然切换到新子航线，更新用于实际执行的 d_last_c 与强制落地
+            d_last_c = d0c
+            fl_last_c = fl_d0c
+            fl_c_s = fl_dcs  # 注意：这里 fl_c_s 基于 0 起算是 OK 的
+
+        # —— 执行：last -> customer（扣行进能量 + 强制落地能量）——
+        e_left    -= d_last_c * rate(payload_left) + fl_last_c * landing_energy
+        t_elapsed += (d_last_c / speed) if speed > 0 else 0.0
+
+        # “真正落地”在客户处，连续里程清零（即便中间强制落地过）
+        since_touchdown = 0.0
+
+        # 访问客户
         sub.append(cid)
-        # 服务并投放
         service_time = f(instance[ckey]['service_time'])
-        t_elapsed += service_time
+        t_elapsed   += service_time
         payload_left -= demand
 
-        # —— 必定去最近充电站
-        d_c_s = D[cidx][sidx]
-        e_left  -= d_c_s * rate(payload_left)     # 注意：已投放后的载荷
-        t_elapsed += d_c_s / speed
-        # 插入站点标记
+        # —— 必去最近充电站：customer -> station（同样扣强制落地能量）——
+        e_left    -= d_c_s * rate(payload_left) + fl_c_s * landing_energy
+        t_elapsed += (d_c_s / speed) if speed > 0 else 0.0
         sub.append(skey)
         last_idx = sidx
 
-        # 充电至满
+        # 到站也是“真正落地”
+        since_touchdown = 0.0
+
+        # 充满
         need_charge = max_e - e_left
-        t_charge    = need_charge / charge_rt if charge_rt > 0 else 0.0
+        t_charge    = (need_charge / charge_rt) if charge_rt > 0 else 0.0
         t_elapsed  += t_charge
         e_left      = max_e
+        # 载荷不在站点补充
 
-        # 注意：不在站点补载荷；载荷只会递减到 0，如不足将触发新子航线
-
-    # 收尾
     if sub:
         route.append(sub)
     return route
+
 
 def run_gavrptw_always_charge(instance_name,
                               unit_cost, init_cost, wait_cost, delay_cost,
